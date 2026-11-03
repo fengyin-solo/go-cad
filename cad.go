@@ -107,6 +107,17 @@ func ParseJSON(data []byte) (*Document, error) { return drawing.ParseJSON(data) 
 // WriteDXF 将文档写出为 DXF 字节流。
 func WriteDXF(doc *Document, w io.Writer) error { return drawing.WriteDXF(doc, w) }
 
+// DXFWriteOptions 按图层子集写出 DXF 的选项（包含/排除图层名）。
+type DXFWriteOptions = drawing.DXFWriteOptions
+
+// WriteDXFWithOptions 按图层子集将文档写出为 DXF 字节流：只写入选中图层
+// 的实体，零层恒保留；块定义只保留实际可达且仍含选中内容者，无实体的图层
+// 表项一并清理。名称在写出前一次性校验（未知图层名汇总报错）。opts 为
+// nil 或包含/排除列表均空时与 WriteDXF 逐字节一致。
+func WriteDXFWithOptions(doc *Document, w io.Writer, opts *DXFWriteOptions) error {
+	return drawing.WriteDXFWithOptions(doc, w, opts)
+}
+
 // DumpEntities 输出模型空间全部实体的对照 JSON（handle/type/字段），
 // 用于与参考实现输出做逐字段一致性对比。
 func DumpEntities(data []byte) (string, error) { return drawing.DumpEntities(data) }

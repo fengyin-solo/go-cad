@@ -102,6 +102,9 @@ type DxfWriter struct {
 	verts *dxfVertexIndex
 	Doc   *Document // 真名/块基点消费源（layerColors/internalObjects）
 	vpID  uint16    // VIEWPORT 69 组码 id 自增器（R2000+ 口径）
+	// plan 图层子集写出计划（WriteDXFWithOptions）：非空时 TABLES/BLOCKS/
+	// ENTITIES 各段只消费计划内清单；为 nil 时走全量写出（WriteDXF 原行为）。
+	plan *dxfFilterPlan
 }
 
 // fail 记录首个错误。
@@ -315,8 +318,12 @@ func (x *DxfWriter) writeTables(doc *Document) {
 	x.ltypeRecord(x.alloc.ltypeCont, "Continuous", "Solid line")
 	x.str(0, "ENDTAB")
 
-	// LAYER 表：0 层恒存在 + 模型空间引用到的全部图层
+	// LAYER 表：0 层恒存在 + 模型空间引用到的全部图层；
+	// 图层子集写出时只保留 0 层 + 实际写出实体引用到的图层（plan.layers）。
 	layers := dxfCollectLayers(doc)
+	if x.plan != nil {
+		layers = x.plan.layers
+	}
 	x.str(0, "TABLE")
 	x.str(2, "LAYER")
 	x.hex(5, x.alloc.layerTable)
@@ -543,20 +550,36 @@ func (x *DxfWriter) writeBlocks(doc *Document) {
 	x.blockBegin(x.alloc.take(), x.alloc.msRecord, "*Model_Space", entity.Point3{})
 	x.blockEnd(x.alloc.take(), x.alloc.msRecord)
 
+	if x.plan != nil {
+		// 图层子集：只输出可达且仍含选中内容的块定义（最大块/伪块已在
+		// 规划阶段排除，悬空 INSERT 已修剪）。
+		for h, list := range x.plan.blocks {
+			x.writeBlockDef(h, list)
+		}
+		x.str(0, "ENDSEC")
+		return
+	}
+
 	largest := doc.LargestBlockHeader()
 	pseudo := dxfPseudoBlockKeys(doc)
 	for h, list := range doc.Blocks {
 		if h == largest || pseudo[h] {
 			continue
 		}
-		// BLOCK 标记实体用合成句柄：blocks key 来自 ownerhandle 归类，
-		// 可能与实体句柄撞车；DXF 中 INSERT↔BLOCK 靠名字（组码 2）关联
-		x.blockBegin(x.alloc.take(), x.alloc.msRecord, x.blockName(h), x.blockBasePoint(h))
-		x.writeEntityList(list, false)
-		x.blockEnd(x.alloc.take(), x.alloc.msRecord)
+		x.writeBlockDef(h, list)
 	}
 
 	x.str(0, "ENDSEC")
+}
+
+// writeBlockDef 输出单个块定义：BLOCK 头（合成句柄，真名/基点取文档登记）
+// + 内容实体 + ENDBLK。BLOCK 标记实体用合成句柄：blocks key 来自
+// ownerhandle 归类，可能与实体句柄撞车；DXF 中 INSERT↔BLOCK 靠名字
+// （组码 2）关联。
+func (x *DxfWriter) writeBlockDef(h uint64, list []any) {
+	x.blockBegin(x.alloc.take(), x.alloc.msRecord, x.blockName(h), x.blockBasePoint(h))
+	x.writeEntityList(list, false)
+	x.blockEnd(x.alloc.take(), x.alloc.msRecord)
 }
 
 // dxfPseudoBlockKeys 收集“伪块”key：全部 POLYLINE 实体句柄（其顶点在
@@ -616,6 +639,17 @@ func (x *DxfWriter) writeEntities(list []any, pspace bool) {
 // 主循环跳过孤立顶点/块结构标记（SEQEND 由 POLYLINE 聚合时生成）；
 // 同句柄实体只输出首次出现的（对象图重复条目防御，DXF 句柄必须唯一）。
 func (x *DxfWriter) writeEntityList(list []any, pspace bool) {
+	for _, ent := range dxfEmitSelection(list) {
+		x.writeEntity(ent, pspace)
+	}
+}
+
+// dxfEmitSelection 按 writeEntityList 的同一规则筛选实际会输出的实体
+// （不写出）：POLYLINE 聚合顶点由所属 POLYLINE 输出故跳过；重复句柄只保留
+// 首次；块结构标记（EntBlockLike）与 PFACE 定位/面顶点跳过。供全量写出与
+// 图层子集规划（块内容判空、悬空 INSERT 修剪、图层表收集）共用，保证两侧
+// 对“什么算实体”的判定完全一致。
+func dxfEmitSelection(list []any) []any {
 	owned := map[uint64]bool{}
 	for _, ent := range list {
 		switch e := ent.(type) {
@@ -634,6 +668,7 @@ func (x *DxfWriter) writeEntityList(list []any, pspace bool) {
 		}
 	}
 	seen := map[uint64]bool{}
+	var out []any
 	for _, ent := range list {
 		b := entity.EntityBase(ent)
 		if b == nil {
@@ -648,8 +683,9 @@ func (x *DxfWriter) writeEntityList(list []any, pspace bool) {
 			// 块结构标记由块段/POLYLINE 聚合生成；PFACE 顶点随其 POLYLINE 跳过
 			continue
 		}
-		x.writeEntity(ent, pspace)
+		out = append(out, ent)
 	}
+	return out
 }
 
 // entityHead 实体公共头（0/5/330/100 AcDbEntity/[67]/8），record 为 DXF 记录名。
