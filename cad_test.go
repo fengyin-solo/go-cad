@@ -10,6 +10,7 @@ import (
 	"github.com/unitedrhino/go-cad/internal/objrec"
 	"github.com/unitedrhino/go-cad/internal/testsupport"
 	"math"
+	"os"
 	"testing"
 )
 
@@ -300,5 +301,44 @@ func TestDetectVersion(t *testing.T) {
 	}
 	if _, err := container.DetectVersion([]byte("XXXXXX")); err == nil {
 		t.Error("非法魔数应报错")
+	}
+}
+
+// TestInspectFacade 门面 Inspect/InspectDocument 一站式入口与类型别名：
+// 真实文件返回健康报告，损坏字节返回错误（不 panic）。
+func TestInspectFacade(t *testing.T) {
+	data, err := os.ReadFile("testdata/line_2013.dwg")
+	if err != nil {
+		t.Skip("testdata 不可用")
+	}
+	r, err := Inspect(data)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if r.Status != "ok" || r.SchemaVersion != 1 {
+		t.Fatalf("健康报告异常: status=%s", r.Status)
+	}
+	if r.Summary.ModelSpace == 0 {
+		t.Fatalf("模型空间计数应大于 0")
+	}
+	// InspectDocument 与 Parse 组合等价
+	doc, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	r2, err := InspectDocument(doc)
+	if err != nil {
+		t.Fatalf("InspectDocument: %v", err)
+	}
+	b1, _ := r.JSON()
+	b2, _ := r2.JSON()
+	if string(b1) != string(b2) {
+		t.Fatalf("Inspect 与 Parse+InspectDocument 结果不一致")
+	}
+	if _, err := Inspect([]byte("broken dwg bytes")); err == nil {
+		t.Fatal("损坏字节应返回解析错误")
+	}
+	if _, err := InspectDocument(nil); err == nil {
+		t.Fatal("nil 文档应返回错误")
 	}
 }

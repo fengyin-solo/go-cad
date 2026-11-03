@@ -21,6 +21,36 @@ type TextInfo = drawing.TextInfo
 // DumpEntityRow 单个实体的对照字段（键名与参考实现对齐）。
 type DumpEntityRow = drawing.DumpEntityRow
 
+// HealthReport 只读文档健康检查报告（批处理系统消费的 JSON 合同）。
+type HealthReport = drawing.HealthReport
+
+// HealthSummary 报告汇总计数。
+type HealthSummary = drawing.HealthSummary
+
+// HealthSpaces 模型空间/图纸空间/块内三个空间的统计容器。
+type HealthSpaces = drawing.HealthSpaces
+
+// SpaceStats 单个空间按实体类型/图层的计数。
+type SpaceStats = drawing.SpaceStats
+
+// BlockSpaceStats 块内对象统计（含按块名分桶）。
+type BlockSpaceStats = drawing.BlockSpaceStats
+
+// LayerHealth 图层解析情况（句柄/名/是否具名/引用实体数）。
+type LayerHealth = drawing.LayerHealth
+
+// BlockHealth 块定义情况（句柄/名/是否布局块/实体数）。
+type BlockHealth = drawing.BlockHealth
+
+// SkippedStat 跳过记录数与可定位句柄的逐条失败原因。
+type SkippedStat = drawing.SkippedStat
+
+// FailureInfo 单个可定位句柄的解码失败。
+type FailureInfo = drawing.FailureInfo
+
+// Diagnostic 单条稳定排序后的诊断项。
+type Diagnostic = drawing.Diagnostic
+
 // Entity 对外暴露的图元接口（几何访问用于渲染与包围盒计算）。
 // bounds 为非导出方法：仅本包模型可满足，外部只读消费。
 type Entity interface {
@@ -114,6 +144,24 @@ func DumpEntities(data []byte) (string, error) { return drawing.DumpEntities(dat
 // DumpEntitiesDoc 文档级对照导出：ParseJSON 等外部构造的文档与 Parse
 // 同口径（JSON 输入长尾段的输出对照入口）。
 func DumpEntitiesDoc(doc *Document) (string, error) { return drawing.DumpEntitiesDoc(doc) }
+
+// InspectDocument 对已解析文档执行只读健康检查：按实体类型与图层统计
+// 模型空间/图纸空间/块内对象，列出跳过数量与可取得的失败句柄，检查非有限
+// 几何、缺失图层名、空块与重复句柄，诊断项稳定排序。检查过程不修改文档。
+// 文档为 nil 或不含任何实体时返回清晰错误（调用方不应按诊断报告消费）。
+func InspectDocument(doc *Document) (*HealthReport, error) {
+	return drawing.InspectDocument(doc)
+}
+
+// Inspect 解析 DWG 字节流并执行只读健康检查（Parse + InspectDocument
+// 的一站式入口；DXF 输入请先 ParseDXF 再 InspectDocument）。
+func Inspect(data []byte) (*HealthReport, error) {
+	doc, err := drawing.Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	return drawing.InspectDocument(doc)
+}
 
 // DebugObjectIndexExport 调试用：导出对象图。
 func DebugObjectIndexExport(data []byte) ([]struct {
