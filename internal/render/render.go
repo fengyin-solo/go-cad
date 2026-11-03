@@ -17,9 +17,10 @@ import (
 
 // RenderOptions 渲染参数。
 type RenderOptions struct {
-	Width      int        // 输出宽度像素，默认 2048；高度按包围盒比例确定
+	Width      int        // 输出宽度像素，默认 2048；高度按视口（或自动包围盒）比例确定
 	Background color.RGBA // 背景色，默认白色
 	FontPath   string     // 字形渲染字体文件路径（空=自动探测系统字体；无可用字体回退占位条）
+	Viewport   *Viewport  // 可选世界坐标视口：非 nil 时严格渲染该世界区域，不做自动包围盒、不加 5% 边距
 }
 
 // RenderPNG 将文档模型空间渲染为 PNG 字节流。
@@ -34,36 +35,50 @@ func RenderPNG(doc *drawing.Document, opts RenderOptions) ([]byte, error) {
 	if opts.Background == (color.RGBA{}) {
 		opts.Background = color.RGBA{255, 255, 255, 255}
 	}
+	// 视口在展开图元前校验：零宽/零高/非有限坐标直接返回明确错误，
+	// 不生成空图。
+	viewport, hasViewport, err := resolveViewport(opts.Viewport)
+	if err != nil {
+		return nil, err
+	}
 
 	// 1. 展开全部图元（INSERT 递归变换）到世界坐标描边列表
 	prim := drawing.NewTessellator(doc)
 	prims := prim.ExpandAll()
 	prims = filterRadiatingStrokes(prims)
 
-	// 2. 稳健包围盒：分位窗口 + 主分量收紧（quantileSheetBounds，与
-	// DetectSheets 兜底口径一致）——「中位数±3×p90」在主体图元+远处
-	// 标注簇的双峰分布下会把视口撑大数倍，主体内容被稀释成中部一条
-	bbox := quantileSheetBounds(prims)
-	if bbox.Invalid() {
-		bbox = drawing.Box2{MinX: 0, MinY: 0, MaxX: 1, MaxY: 1}
+	var bbox drawing.Box2
+	if hasViewport {
+		// 显式世界坐标视口：严格按调用方区域出图——跳过自动包围盒、
+		// 原点锚定剔除与 5% 边距，图元在世界坐标内裁到视口。
+		bbox = viewport
+		prims = clipPrimsToViewport(prims, bbox)
+	} else {
+		// 2. 稳健包围盒：分位窗口 + 主分量收紧（quantileSheetBounds，与
+		// DetectSheets 兜底口径一致）——「中位数±3×p90」在主体图元+远处
+		// 标注簇的双峰分布下会把视口撑大数倍，主体内容被稀释成中部一条
+		bbox = quantileSheetBounds(prims)
+		if bbox.Invalid() {
+			bbox = drawing.Box2{MinX: 0, MinY: 0, MaxX: 1, MaxY: 1}
+		}
+		// 剔除「原点锚定的超长线」：错位解码的 LINE 常一端落在原点附近、
+		// 另一端指向真实图形位置，形成放射状噪声
+		prims = dropOriginAnchored(prims, bbox)
+		marginX := (bbox.MaxX - bbox.MinX) * 0.05
+		marginY := (bbox.MaxY - bbox.MinY) * 0.05
+		if marginX == 0 && marginY == 0 {
+			marginX, marginY = 1, 1 // 退化（单点/空图）兜底
+		} else if marginX == 0 {
+			marginX = marginY
+		} else if marginY == 0 {
+			marginY = marginX
+		}
+		bbox.MinX -= marginX
+		bbox.MaxX += marginX
+		bbox.MinY -= marginY
+		bbox.MaxY += marginY
 	}
-	// 剔除「原点锚定的超长线」：错位解码的 LINE 常一端落在原点附近、
-	// 另一端指向真实图形位置，形成放射状噪声
-	prims = dropOriginAnchored(prims, bbox)
 	width := float64(opts.Width)
-	marginX := (bbox.MaxX - bbox.MinX) * 0.05
-	marginY := (bbox.MaxY - bbox.MinY) * 0.05
-	if marginX == 0 && marginY == 0 {
-		marginX, marginY = 1, 1 // 退化（单点/空图）兜底
-	} else if marginX == 0 {
-		marginX = marginY
-	} else if marginY == 0 {
-		marginY = marginX
-	}
-	bbox.MinX -= marginX
-	bbox.MaxX += marginX
-	bbox.MinY -= marginY
-	bbox.MaxY += marginY
 	scale := width / (bbox.MaxX - bbox.MinX)
 	height := int((bbox.MaxY-bbox.MinY)*scale + 0.5)
 	if height < 1 {

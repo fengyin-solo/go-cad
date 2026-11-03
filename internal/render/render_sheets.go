@@ -1568,6 +1568,12 @@ func (sp *sheetPipeline) sheetWidthFor(vp drawing.Box2, sheet Sheet, width int) 
 // 控制，只统计达标率不自动重渲（整图全览张即走该路径不被放大）。
 // 返回 PNG 字节流、最终渲染宽度、文字清晰达标率（0~1）与自动重渲次数。
 func (sp *sheetPipeline) renderPNG(sheet Sheet, opts RenderOptions) ([]byte, int, float64, int, error) {
+	// 显式世界坐标视口：严格渲染调用方所选区域（不用图框包围盒、无 2%
+	// 外扩），宽度由调用方掌控，不做按文字自适应与清晰度重渲。
+	if opts.Viewport != nil {
+		data, width, err := sp.renderRegionPNG(opts.Viewport.box(), opts)
+		return data, width, 1, 0, err
+	}
 	vp := sheetViewport(sheet.Box)
 	width := sp.sheetWidthFor(vp, sheet, opts.Width)
 	vw := vp.MaxX - vp.MinX
@@ -1632,6 +1638,37 @@ func (sp *sheetPipeline) renderPNGAt(vp drawing.Box2, width int, opts RenderOpti
 	return buf.Bytes(), nil
 }
 
+// renderRegionPNG 按显式世界坐标视口渲染单张 PNG（RenderSheetPNG 的
+// 视口路径）：世界→像素变换严格对应 vp（无图框 2% 外扩、无自动包围盒
+// 边距），图元在世界坐标内裁到视口；宽度由调用方指定（<=0 默认
+// 2048），高度按视口宽高比确定。不参与按文字自适应与清晰度重渲。
+func (sp *sheetPipeline) renderRegionPNG(vp drawing.Box2, opts RenderOptions) ([]byte, int, error) {
+	width := opts.Width
+	if width <= 0 {
+		width = 2048
+	}
+	prims := clipPrimsToViewport(sp.prims, vp)
+	vw := vp.MaxX - vp.MinX
+	scale := float64(width) / vw
+	height := int((vp.MaxY-vp.MinY)*scale + 0.5)
+	if height < 1 {
+		height = 1
+	}
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	drawRect(img, img.Rect, opts.Background)
+	cv := &canvas{img: img, width: float64(width), height: float64(height), lineWidth: adaptiveLineWidth(float64(width)), fontPath: opts.FontPath}
+	cv.setTransform(vp, scale)
+	bgWhite := opts.Background.R > 127
+	for i := range prims {
+		cv.drawPrimitive(prims[i], sp.doc, bgWhite)
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, width, err
+	}
+	return buf.Bytes(), width, nil
+}
+
 // sheetTextPassRate 渲染后清晰度自检：统计视口内全部文本 label 的
 // 渲染像素高（世界字高 × scale，label 基向量模长已含块变换比例）达
 // sheetTextMinPx 的占比。无文本的图框无清晰度问题，视为达标 1。
@@ -1673,6 +1710,11 @@ func sheetPixelsOK(vp drawing.Box2, width int) bool {
 // 序列化与整图 RenderSVG 同一发射器（文字 text 元素由查看器字体渲染）。
 // SVG 矢量无像素概念，清晰度自检与自动重渲不适用，返回名义宽度。
 func (sp *sheetPipeline) renderSVG(sheet Sheet, opts RenderOptions) ([]byte, int, error) {
+	// 显式世界坐标视口：viewBox 严格对应调用方所选区域（不用图框
+	// 包围盒、无 2% 外扩），宽度由调用方掌控。
+	if opts.Viewport != nil {
+		return sp.renderRegionSVG(opts.Viewport.box(), sheet.Name, opts)
+	}
 	vp := sheetViewport(sheet.Box)
 	width := sp.sheetWidthFor(vp, sheet, opts.Width)
 	vw := vp.MaxX - vp.MinX
@@ -1695,6 +1737,37 @@ func (sp *sheetPipeline) renderSVG(sheet Sheet, opts RenderOptions) ([]byte, int
 			continue
 		}
 		em.emit(sp.doc, &sp.prims[i], bgWhite)
+	}
+	return em.finish(width, height, vw, vh), width, nil
+}
+
+// renderRegionSVG 按显式世界坐标视口渲染单张 SVG（RenderSheetSVG 的
+// 视口路径）：viewBox 严格对应 vp（无图框 2% 外扩、无自动包围盒
+// 边距），图元在世界坐标内裁到视口；宽度由调用方指定（<=0 默认
+// 2048），高度按视口宽高比确定。
+func (sp *sheetPipeline) renderRegionSVG(vp drawing.Box2, name string, opts RenderOptions) ([]byte, int, error) {
+	width := opts.Width
+	if width <= 0 {
+		width = 2048
+	}
+	prims := clipPrimsToViewport(sp.prims, vp)
+	vw := vp.MaxX - vp.MinX
+	vh := vp.MaxY - vp.MinY
+	wf := float64(width)
+	height := int(vh/vw*wf + 0.5)
+	if height < 1 {
+		height = 1
+	}
+	strokeW := vw / wf * 1.5
+	bgWhite := opts.Background.R > 127
+	em := newSVGEmitter(vp, strokeW, opts.Background, &svgDocMeta{
+		Generator: "go-cad",
+		Version:   sp.doc.Version(),
+		Entities:  len(prims),
+		Sheet:     name,
+	})
+	for i := range prims {
+		em.emit(sp.doc, &prims[i], bgWhite)
 	}
 	return em.finish(width, height, vw, vh), width, nil
 }
@@ -1749,21 +1822,35 @@ func normalizeSheetOptions(opts RenderOptions) RenderOptions {
 // RenderSheetPNG 渲染单个图框为 PNG 字节流。opts.Width 未指定时按框内
 // 文字自适应起步（主体文字像素高 ≥8px，下限 4096），渲染后执行清晰度
 // 自检与自动重渲（见 renderPNG）；显式指定宽度则完全由调用方控制。
+// opts.Viewport 非 nil 时改为严格渲染该世界坐标区域（覆盖 sheet.Box
+// 与 2% 外扩，不做自适应与重渲），宽度由 opts.Width 指定、高度按
+// 视口宽高比确定；零宽/零高/非有限坐标返回错误。
 func RenderSheetPNG(doc *drawing.Document, sheet Sheet, opts RenderOptions) ([]byte, error) {
 	if doc == nil {
 		return nil, fmt.Errorf("cad: 文档为空，无法渲染")
 	}
 	opts = normalizeSheetOptions(opts)
+	// 视口在展开图元前校验：非法视口直接返回明确错误，不生成空图。
+	if _, _, err := resolveViewport(opts.Viewport); err != nil {
+		return nil, err
+	}
 	data, _, _, _, err := prepareSheets(doc).renderPNG(sheet, opts)
 	return data, err
 }
 
 // RenderSheetSVG 渲染单个图框为 SVG 矢量字节流（viewBox 裁剪到图框）。
+// opts.Viewport 非 nil 时 viewBox 严格对应所选世界区域（覆盖 sheet.Box
+// 与 2% 外扩），宽度由 opts.Width 指定、高度按视口宽高比确定；
+// 零宽/零高/非有限坐标返回错误。
 func RenderSheetSVG(doc *drawing.Document, sheet Sheet, opts RenderOptions) ([]byte, error) {
 	if doc == nil {
 		return nil, fmt.Errorf("cad: 文档为空，无法渲染")
 	}
 	opts = normalizeSheetOptions(opts)
+	// 视口在展开图元前校验：非法视口直接返回明确错误，不生成空图。
+	if _, _, err := resolveViewport(opts.Viewport); err != nil {
+		return nil, err
+	}
 	data, _, err := prepareSheets(doc).renderSVG(sheet, opts)
 	return data, err
 }
@@ -1783,6 +1870,9 @@ func RenderAllSheets(doc *drawing.Document, opts RenderOptions, format string) (
 		return nil, fmt.Errorf("cad: 不支持的输出格式 %q（可选 png/svg）", format)
 	}
 	opts = normalizeSheetOptions(opts)
+	// 批量出图以识别出的图框为视口来源，调用方的单选区域视口不适用
+	// （逐图框语义由 RenderSheetPNG/RenderSVG 承载），显式忽略。
+	opts.Viewport = nil
 	sheets := DetectSheets(doc)
 	sp := prepareSheets(doc)
 	if len(sheets) != 1 || sheets[0].Name != "整图" {

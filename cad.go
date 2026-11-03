@@ -27,8 +27,13 @@ type Entity interface {
 	bounds() drawing.Box2
 }
 
-// RenderOptions 渲染选项（尺寸/背景等）。
+// RenderOptions 渲染选项（尺寸/背景/世界坐标视口等）。
 type RenderOptions = render.RenderOptions
+
+// Viewport 可选世界坐标视口：设置后渲染严格对应该世界区域，
+// 不做整图自动包围盒、不加 5% 边距；输出宽度由 RenderOptions.Width
+// 指定，高度按视口宽高比确定。零宽/零高/非有限坐标返回错误。
+type Viewport = render.Viewport
 
 // Sheet 图纸分幅定义。
 type Sheet = render.Sheet

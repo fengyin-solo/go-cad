@@ -44,6 +44,8 @@ const svgExpandBudget = 2000000
 // RenderSVG 将文档模型空间渲染为 SVG 矢量字节流。
 // opts.Width 决定固有像素宽度与线宽基准（viewBox 保持世界坐标，缩放无损）；
 // 高度按包围盒比例确定；背景色填充 rect（默认白色，与 RenderPNG 一致）。
+// opts.Viewport 非 nil 时 viewBox 严格对应所选世界区域（无自动包围盒、
+// 无 5% 边距），图元在世界坐标内裁到视口；零宽/零高/非有限坐标报错。
 func RenderSVG(doc *drawing.Document, opts RenderOptions) ([]byte, error) {
 	// nil 文档防御：与 RenderPNG 等导出 API 的错误返回口径一致，不 panic
 	if doc == nil {
@@ -55,6 +57,12 @@ func RenderSVG(doc *drawing.Document, opts RenderOptions) ([]byte, error) {
 	if opts.Background == (color.RGBA{}) {
 		opts.Background = color.RGBA{255, 255, 255, 255}
 	}
+	// 视口在展开图元前校验：零宽/零高/非有限坐标直接返回明确错误，
+	// 不生成空图。
+	viewport, hasViewport, err := resolveViewport(opts.Viewport)
+	if err != nil {
+		return nil, err
+	}
 
 	// 与 RenderPNG 完全一致的展开与过滤管线（含 INSERT 递归展开）。
 	// 展开预算单独放宽（PNG 路径保持 20 万不动，金标输出不受影响）：
@@ -64,26 +72,35 @@ func RenderSVG(doc *drawing.Document, opts RenderOptions) ([]byte, error) {
 	prim.Budget = svgExpandBudget
 	prims := prim.ExpandAll()
 	prims = filterRadiatingStrokes(prims)
-	// 与 RenderPNG 同口径：分位窗口 + 主分量收紧，双峰分布不再撑大视口
-	bbox := quantileSheetBounds(prims)
-	if bbox.Invalid() {
-		bbox = drawing.Box2{MinX: 0, MinY: 0, MaxX: 1, MaxY: 1}
-	}
-	prims = dropOriginAnchored(prims, bbox)
 
-	marginX := (bbox.MaxX - bbox.MinX) * 0.05
-	marginY := (bbox.MaxY - bbox.MinY) * 0.05
-	if marginX == 0 && marginY == 0 {
-		marginX, marginY = 1, 1 // 退化（单点/空图）兜底
-	} else if marginX == 0 {
-		marginX = marginY
-	} else if marginY == 0 {
-		marginY = marginX
+	var bbox drawing.Box2
+	if hasViewport {
+		// 显式世界坐标视口：viewBox 严格对应所选世界区域，跳过自动
+		// 包围盒、原点锚定剔除与 5% 边距，图元在世界坐标内裁到视口。
+		bbox = viewport
+		prims = clipPrimsToViewport(prims, bbox)
+	} else {
+		// 与 RenderPNG 同口径：分位窗口 + 主分量收紧，双峰分布不再撑大视口
+		bbox = quantileSheetBounds(prims)
+		if bbox.Invalid() {
+			bbox = drawing.Box2{MinX: 0, MinY: 0, MaxX: 1, MaxY: 1}
+		}
+		prims = dropOriginAnchored(prims, bbox)
+
+		marginX := (bbox.MaxX - bbox.MinX) * 0.05
+		marginY := (bbox.MaxY - bbox.MinY) * 0.05
+		if marginX == 0 && marginY == 0 {
+			marginX, marginY = 1, 1 // 退化（单点/空图）兜底
+		} else if marginX == 0 {
+			marginX = marginY
+		} else if marginY == 0 {
+			marginY = marginX
+		}
+		bbox.MinX -= marginX
+		bbox.MaxX += marginX
+		bbox.MinY -= marginY
+		bbox.MaxY += marginY
 	}
-	bbox.MinX -= marginX
-	bbox.MaxX += marginX
-	bbox.MinY -= marginY
-	bbox.MaxY += marginY
 	vw := bbox.MaxX - bbox.MinX
 	vh := bbox.MaxY - bbox.MinY
 	width := float64(opts.Width)
