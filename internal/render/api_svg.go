@@ -63,6 +63,14 @@ func RenderSVG(doc *drawing.Document, opts RenderOptions) ([]byte, error) {
 	prim := drawing.NewTessellator(doc)
 	prim.Budget = svgExpandBudget
 	prims := prim.ExpandAll()
+	// 图层过滤（与 RenderPNG 同语义、同位置：展开后、几何过滤前）：
+	// 被过滤图元不进入发射器，分组 <g> 与 metadata 图层清单天然只含
+	// 实际输出的图层；未给名单时输出字节级不变
+	lf, err := newLayerFilter(doc, prims, opts)
+	if err != nil {
+		return nil, err
+	}
+	prims = lf.apply(prims)
 	prims = filterRadiatingStrokes(prims)
 	// 与 RenderPNG 同口径：分位窗口 + 主分量收紧，双峰分布不再撑大视口
 	bbox := quantileSheetBounds(prims)
@@ -173,18 +181,14 @@ func (em *svgEmitter) xy(x, y float64) (int64, int64) {
 		int64(math.Round((em.bbox.MaxY - y) * 1000))
 }
 
-// layerID 图层句柄 → 分组 id 片段：有名图层用真名（doc.layerColors 解析
-// 产物），无名/无图层信息用 handle-<hex>；按句柄缓存免逐图元格式化。
+// layerID 图层句柄 → 分组 id 片段：与图层过滤共用 layerIdentifier
+// （有名图层用真名，无名/无图层信息用 handle-<hex>），保证过滤名单、
+// 分组 id、metadata 图层清单三者标识一致；按句柄缓存免逐图元格式化。
 func (em *svgEmitter) layerID(doc *drawing.Document, h uint64) string {
 	if id, ok := em.layerIDs[h]; ok {
 		return id
 	}
-	id := ""
-	if lc, ok := doc.LayerColors[h]; ok && lc.Name != "" {
-		id = lc.Name
-	} else {
-		id = fmt.Sprintf("handle-%X", h)
-	}
+	id := layerIdentifier(doc, h)
 	em.layerIDs[h] = id
 	return id
 }

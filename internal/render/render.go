@@ -20,6 +20,17 @@ type RenderOptions struct {
 	Width      int        // 输出宽度像素，默认 2048；高度按包围盒比例确定
 	Background color.RGBA // 背景色，默认白色
 	FontPath   string     // 字形渲染字体文件路径（空=自动探测系统字体；无可用字体回退占位条）
+	// IncludeLayers 图层白名单：非空时仅输出最终图层标识命中名单的图元。
+	// 有名图层按图层名匹配；无名图层按稳定句柄标识 "handle-<十六进制句柄>"
+	// 匹配（大写为规范写法，十六进制部分大小写不敏感）。块引用（含嵌套块）
+	// 内部展开后的图元按其最终所属图层判定。
+	IncludeLayers []string
+	// ExcludeLayers 图层排除名单：命中名单的图元不输出。与白名单同时给出
+	// 时先应用白名单再应用排除；空名单（nil 或长度 0）表示不限制。
+	// 名单含文档不存在的图层标识时渲染返回错误（错误包含该标识）。
+	// PNG/SVG/单图框/全部图框渲染共用同一套过滤语义；过滤后视口包围盒、
+	// SVG 分组与 metadata、图框清晰度统计均只统计实际输出的图元。
+	ExcludeLayers []string
 }
 
 // RenderPNG 将文档模型空间渲染为 PNG 字节流。
@@ -38,6 +49,13 @@ func RenderPNG(doc *drawing.Document, opts RenderOptions) ([]byte, error) {
 	// 1. 展开全部图元（INSERT 递归变换）到世界坐标描边列表
 	prim := drawing.NewTessellator(doc)
 	prims := prim.ExpandAll()
+	// 图层过滤（白名单/排除名单，四入口同语义）：先于几何过滤与包围盒，
+	// 视口只拟合实际输出内容；未给名单时 apply 原样返回，金标路径零变化
+	lf, err := newLayerFilter(doc, prims, opts)
+	if err != nil {
+		return nil, err
+	}
+	prims = lf.apply(prims)
 	prims = filterRadiatingStrokes(prims)
 
 	// 2. 稳健包围盒：分位窗口 + 主分量收紧（quantileSheetBounds，与

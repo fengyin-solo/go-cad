@@ -228,6 +228,7 @@ type sheetTextLike struct {
 	X, y   float64 // 插入点（世界坐标）
 	hWorld float64 // 世界字高
 	text   string
+	layer  uint64 // 直属图层句柄（图层过滤后自适应宽度统计用）
 }
 
 // sheetDetector 图框检测器：共享顶点索引与展开预算，块定义局部展开
@@ -1474,41 +1475,60 @@ type sheetPipeline struct {
 	doc        *drawing.Document
 	prims      []drawing.Primitive
 	modelTexts []sheetTextLike // 直属文本（自适应宽度统计用）
+	lf         *layerFilter    // 图层过滤器（空名单 = 全部保留）
 }
 
-// prepareSheets 构建共享渲染管线：展开/放射线过滤/原点锚定剔除与
-// RenderPNG 完全一致（渲染管线全部复用，金标路径不受影响）；基准框
-// 同 RenderPNG 用分位口径（quantileSheetBounds），双峰分布不撑大剔除窗口。
+// prepareSheets 无图层过滤的共享渲染管线（检测路径与既有测试使用）。
 func prepareSheets(doc *drawing.Document) *sheetPipeline {
+	sp, err := prepareSheetsFiltered(doc, RenderOptions{})
+	if err != nil {
+		// 空名单不会产生未知图层错误
+		panic(fmt.Errorf("cad: 内部错误：空图层名单不应校验失败: %w", err))
+	}
+	return sp
+}
+
+// prepareSheetsFiltered 构建共享渲染管线：展开 → 图层过滤（白名单/排除
+// 名单，与 RenderPNG/RenderSVG 同语义、同位置）→ 放射线过滤/原点锚定
+// 剔除，全部与 RenderPNG 一致（渲染管线全部复用，金标路径不受影响）；
+// 基准框同 RenderPNG 用分位口径（quantileSheetBounds），双峰分布不撑大
+// 剔除窗口。名单含未知图层标识时返回错误（错误包含该标识）。
+func prepareSheetsFiltered(doc *drawing.Document, opts RenderOptions) (*sheetPipeline, error) {
 	prim := drawing.NewTessellator(doc)
 	prims := prim.ExpandAll()
+	lf, err := newLayerFilter(doc, prims, opts)
+	if err != nil {
+		return nil, err
+	}
+	prims = lf.apply(prims)
 	prims = filterRadiatingStrokes(prims)
 	bbox := quantileSheetBounds(prims)
 	if bbox.Invalid() {
 		bbox = drawing.Box2{MinX: 0, MinY: 0, MaxX: 1, MaxY: 1}
 	}
 	prims = dropOriginAnchored(prims, bbox)
-	return &sheetPipeline{doc: doc, prims: prims, modelTexts: collectModelTexts(doc)}
+	return &sheetPipeline{doc: doc, prims: prims, modelTexts: collectModelTexts(doc), lf: lf}, nil
 }
 
-// collectModelTexts 模型空间直属文本清单（图名提取与自适应宽度共用）。
+// collectModelTexts 模型空间直属文本清单（图名提取与自适应宽度共用），
+// 携带直属图层句柄供图层过滤后的自适应宽度统计剔除。
 func collectModelTexts(doc *drawing.Document) []sheetTextLike {
 	var out []sheetTextLike
-	add := func(x, y, h float64, text string) {
+	add := func(layer uint64, x, y, h float64, text string) {
 		if drawing.Plausible(x, y) && h > 0 {
 			if t := strings.TrimSpace(text); t != "" {
-				out = append(out, sheetTextLike{X: x, y: y, hWorld: h, text: t})
+				out = append(out, sheetTextLike{X: x, y: y, hWorld: h, text: t, layer: layer})
 			}
 		}
 	}
 	for _, ent := range doc.ModelSpace {
 		switch e := ent.(type) {
 		case *entity.EntText:
-			add(e.Insertion.X, e.Insertion.Y, e.Height, e.Text)
+			add(e.Layer, e.Insertion.X, e.Insertion.Y, e.Height, e.Text)
 		case *entity.EntMText:
-			add(e.Insertion.X, e.Insertion.Y, e.TextHeight, drawing.StripMTextFormat(e.Text))
+			add(e.Layer, e.Insertion.X, e.Insertion.Y, e.TextHeight, drawing.StripMTextFormat(e.Text))
 		case *entity.EntAttrib:
-			add(e.Insertion.X, e.Insertion.Y, e.Height, e.Text)
+			add(e.Layer, e.Insertion.X, e.Insertion.Y, e.Height, e.Text)
 		}
 	}
 	return out
@@ -1535,6 +1555,11 @@ func (sp *sheetPipeline) sheetWidthFor(vp drawing.Box2, sheet Sheet, width int) 
 	}
 	b := drawing.Box2{MinX: sheet.Box[0], MinY: sheet.Box[1], MaxX: sheet.Box[2], MaxY: sheet.Box[3]}
 	for _, t := range sp.modelTexts {
+		// 被图层过滤排除的直属文本同样不参与自适应宽度（与展开图元、
+		// 清晰度统计同口径）
+		if !sp.lf.keepHandle(t.layer) {
+			continue
+		}
 		if pointInBox(t.X, t.y, b) {
 			hs = append(hs, t.hWorld)
 		}
@@ -1754,7 +1779,11 @@ func RenderSheetPNG(doc *drawing.Document, sheet Sheet, opts RenderOptions) ([]b
 		return nil, fmt.Errorf("cad: 文档为空，无法渲染")
 	}
 	opts = normalizeSheetOptions(opts)
-	data, _, _, _, err := prepareSheets(doc).renderPNG(sheet, opts)
+	sp, err := prepareSheetsFiltered(doc, opts)
+	if err != nil {
+		return nil, err
+	}
+	data, _, _, _, err := sp.renderPNG(sheet, opts)
 	return data, err
 }
 
@@ -1764,7 +1793,11 @@ func RenderSheetSVG(doc *drawing.Document, sheet Sheet, opts RenderOptions) ([]b
 		return nil, fmt.Errorf("cad: 文档为空，无法渲染")
 	}
 	opts = normalizeSheetOptions(opts)
-	data, _, err := prepareSheets(doc).renderSVG(sheet, opts)
+	sp, err := prepareSheetsFiltered(doc, opts)
+	if err != nil {
+		return nil, err
+	}
+	data, _, err := sp.renderSVG(sheet, opts)
 	return data, err
 }
 
@@ -1784,7 +1817,10 @@ func RenderAllSheets(doc *drawing.Document, opts RenderOptions, format string) (
 	}
 	opts = normalizeSheetOptions(opts)
 	sheets := DetectSheets(doc)
-	sp := prepareSheets(doc)
+	sp, err := prepareSheetsFiltered(doc, opts)
+	if err != nil {
+		return nil, err
+	}
 	if len(sheets) != 1 || sheets[0].Name != "整图" {
 		if b := quantileSheetBounds(sp.prims); !b.Invalid() {
 			sheets = append([]Sheet{{Name: "整图全览", Box: [4]float64{b.MinX, b.MinY, b.MaxX, b.MaxY}}}, sheets...)
@@ -1804,7 +1840,6 @@ func RenderAllSheets(doc *drawing.Document, opts RenderOptions, format string) (
 		var width int
 		var rate float64
 		var rerenders int
-		var err error
 		if strings.EqualFold(strings.TrimSpace(format), "svg") {
 			data, width, err = sp.renderSVG(s, opt)
 			rate = -1 // SVG 矢量无像素概念，达标率未统计
